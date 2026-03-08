@@ -7,5 +7,6 @@ asyncpg==0.30.0
 pytz
 numpy==1.26.4
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.1.0+cpu
-sentence-transformers==3.0.1
+torch==2.4.0+cpu
+sentence-transformers==2.7.0
+transformers==4.40.0
