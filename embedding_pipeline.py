@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ─── ГЛАВНОЕ ИЗМЕНЕНИЕ ───────────────────────
 # L12 → L6: та же архитектура, те же 384-мерные векторы,
 # но 6 слоёв вместо 12 — помещается в 512MB Railway.
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L6-v2"
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L6-v2"
 
 
 # ─────────────────────────────────────────────
