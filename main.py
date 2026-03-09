@@ -33,6 +33,10 @@ from telegram.ext import (
     filters,
 )
 
+# Reassemble split ONNX model before importing the pipeline
+import reassemble_model
+reassemble_model.reassemble()
+
 from resume_parser import ResumeParser
 from embedding_pipeline import get_pipeline
 import database as db
