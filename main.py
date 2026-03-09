@@ -1867,7 +1867,7 @@ async def handle_hr_vacancy_input(update: Update, context: ContextTypes.DEFAULT_
 
         if r["source"] == "our":
             username = r.get("username")
-            contact = f"@{username}" if username else f"[написать](tg://user?id={r['user_id']})"
+            contact = f"@{username}" if username else f"tg://user?id={r['user_id']}"
             source_badge = "👤 Наш пользователь"
         else:
             contact = r.get("url", "")
@@ -1880,7 +1880,6 @@ async def handle_hr_vacancy_input(update: Update, context: ContextTypes.DEFAULT_
             f"💼 Опыт: {exp_str}\n"
             f"🔧 Навыки: {skills_str}\n"
             f"{source_badge} | {contact}",
-            parse_mode="Markdown",
             disable_web_page_preview=True,
         )
 
