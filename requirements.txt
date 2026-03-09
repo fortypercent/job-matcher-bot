@@ -7,11 +7,8 @@ asyncpg==0.30.0
 pytz
 numpy==1.26.4
 
-# ── ONNX Runtime replaces PyTorch ─────────────
-# PyTorch: ~200MB RAM at runtime
-# ONNX Runtime: ~30MB RAM at runtime
-# Same model, same vectors, fraction of the memory.
+# ── ONNX Runtime only (no PyTorch!) ───────────
+# Total image: ~800MB instead of 8.4GB
 onnxruntime==1.17.0
-optimum[onnxruntime]==1.17.1
 transformers==4.40.0
-sentence-transformers==2.7.0
+tokenizers

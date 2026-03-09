@@ -1,32 +1,29 @@
 """
 embedding_pipeline.py — векторизация резюме и вакансий + матчинг
 
-СТРАТЕГИЯ (OOM-fix):
-L6 модель заблокирована на HuggingFace (401), поэтому оставляем L12.
-Вместо этого убираем PyTorch и используем ONNX Runtime:
-  - PyTorch runtime: ~200MB RAM → ONNX Runtime: ~30MB RAM
-  - L12 модель ONNX: ~280MB в памяти
-  - Итого: ~350MB вместо ~700MB → помещается в 512MB Railway
-
-Модель: paraphrase-multilingual-MiniLM-L12-v2 (ONNX)
-- Работает на CPU
-- Поддерживает русский + английский
-- Размер вектора: 384 числа
+Использует ONNX Runtime напрямую (без PyTorch, без sentence-transformers).
+Модель: paraphrase-multilingual-MiniLM-L12-v2 (quantized ONNX)
+- ~120MB на диске, ~150MB в RAM
+- Вектор: 384 числа
+- CPU only
 """
 
 import gc
 import logging
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from optimum.onnxruntime import ORTModelForFeatureExtraction
+import onnxruntime as ort
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+# Путь к локальной ONNX модели (bundled in repo)
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "onnx_model_quantized")
 
 
 # ─────────────────────────────────────────────
@@ -68,25 +65,41 @@ class MatchResult:
 
 
 # ─────────────────────────────────────────────
-# ONNX-обёртка (заменяет PyTorch целиком)
+# Лёгкий ONNX embedder (без PyTorch!)
 # ─────────────────────────────────────────────
 
 
 class ONNXEmbedder:
     """
-    Загружает модель через ONNX Runtime вместо PyTorch.
-    Экономит ~200MB RAM за счёт отсутствия PyTorch.
-    Интерфейс совместим с SentenceTransformer.encode().
+    Загружает квантизированную ONNX модель напрямую.
+    Зависимости: только onnxruntime + transformers (для токенизатора).
+    RAM: ~150MB вместо ~700MB с PyTorch.
     """
 
-    def __init__(self, model_name: str):
-        logger.info("Загрузка ONNX модели %s...", model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = ORTModelForFeatureExtraction.from_pretrained(
-            model_name, export=True
+    def __init__(self, model_dir: str):
+        logger.info("Загрузка ONNX модели из %s...", model_dir)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+        # Ищем .onnx файл в директории
+        onnx_files = list(Path(model_dir).glob("*.onnx"))
+        if not onnx_files:
+            raise FileNotFoundError(f"No .onnx file found in {model_dir}")
+        onnx_path = str(onnx_files[0])
+
+        # Настраиваем ONNX Runtime на минимальное потребление RAM
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.session = ort.InferenceSession(
+            onnx_path,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
         )
-        gc.collect()
-        logger.info("ONNX модель загружена ✅")
+
+        logger.info("ONNX модель загружена ✅ (%s)", Path(onnx_path).name)
 
     def encode(
         self,
@@ -110,12 +123,25 @@ class ONNXEmbedder:
                 max_length=128,
                 return_tensors="np",
             )
-            outputs = self.model(**inputs)
+
+            # ONNX Runtime inference
+            ort_inputs = {
+                "input_ids": inputs["input_ids"].astype(np.int64),
+                "attention_mask": inputs["attention_mask"].astype(np.int64),
+            }
+            # Add token_type_ids if the model expects it
+            if "token_type_ids" in [inp.name for inp in self.session.get_inputs()]:
+                ort_inputs["token_type_ids"] = inputs.get(
+                    "token_type_ids",
+                    np.zeros_like(inputs["input_ids"]),
+                ).astype(np.int64)
+
+            outputs = self.session.run(None, ort_inputs)
+            token_embeddings = outputs[0]  # (batch, seq_len, hidden_size)
 
             # Mean pooling
-            token_embeddings = outputs.last_hidden_state
-            attention_mask = inputs["attention_mask"]
-            mask_expanded = np.expand_dims(attention_mask, -1).astype(np.float32)
+            attention_mask = inputs["attention_mask"].astype(np.float32)
+            mask_expanded = np.expand_dims(attention_mask, -1)
             sum_embeddings = np.sum(token_embeddings * mask_expanded, axis=1)
             sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
             embeddings = sum_embeddings / sum_mask
@@ -124,7 +150,7 @@ class ONNXEmbedder:
                 norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                 embeddings = embeddings / np.clip(norms, a_min=1e-9, a_max=None)
 
-            all_embeddings.append(embeddings)
+            all_embeddings.append(embeddings.astype(np.float32))
 
         result = np.vstack(all_embeddings) if len(all_embeddings) > 1 else all_embeddings[0]
         gc.collect()
@@ -142,11 +168,11 @@ class ONNXEmbedder:
 class EmbeddingPipeline:
     """
     Загружает модель, создаёт векторы, считает совпадение.
-    Использует ONNX Runtime для экономии RAM.
+    Использует ONNX Runtime — никакого PyTorch.
     """
 
-    def __init__(self, model_name: str = MODEL_NAME):
-        self.model = ONNXEmbedder(model_name)
+    def __init__(self, model_dir: str = MODEL_DIR):
+        self.model = ONNXEmbedder(model_dir)
 
     # ── Создание векторов ──────────────────────
 
@@ -212,7 +238,6 @@ class EmbeddingPipeline:
                     source=source,
                 )
             )
-
         return results
 
     def similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
