@@ -3,7 +3,7 @@ Telegram-бот для матчинга резюме и вакансий.
 
 Изменения (OOM-fix + баги):
 1. Модель загружается лениво (lazy), а не при импорте — экономит RAM при старте.
-2. torch.no_grad() на каждом encode — убирает аллокации на градиенты.
+2. PyTorch заменён на ONNX Runtime — экономит ~200MB RAM.
 3. gc.collect() после тяжёлых операций — возвращает RAM ОС.
 4. Убран дублированный блок кода после callback_exp_done (мёртвый код с salary).
 5. logger вместо смеси print/logging.
@@ -22,7 +22,6 @@ from datetime import datetime
 import httpx
 import numpy as np
 import pytz
-import torch
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -68,16 +67,14 @@ def pipeline():
 
 def embed_resume_safe(resume):
     """Эмбеддинг резюме с защитой от утечки памяти."""
-    with torch.no_grad():
-        vec = pipeline().embed_resume(resume)
+    vec = pipeline().embed_resume(resume)
     gc.collect()
     return vec
 
 
 def encode_text_safe(text: str):
     """Эмбеддинг произвольного текста с защитой от утечки памяти."""
-    with torch.no_grad():
-        vec = pipeline().model.encode(text, normalize_embeddings=True)
+    vec = pipeline().model.encode(text, normalize_embeddings=True)
     gc.collect()
     return vec
 
@@ -1508,8 +1505,7 @@ async def send_digest_tick(context: ContextTypes.DEFAULT_TYPE):
             embedding_str = sub.get("embedding", "[]")
             resume_vector = np.array(json.loads(embedding_str), dtype=np.float32)
 
-            with torch.no_grad():
-                matches = pipeline().match(resume_vector, vacancies, top_k=5)
+            matches = pipeline().match(resume_vector, vacancies, top_k=5)
             gc.collect()
 
             if not matches:

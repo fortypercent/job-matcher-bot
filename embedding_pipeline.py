@@ -1,19 +1,17 @@
 """
 embedding_pipeline.py — векторизация резюме и вакансий + матчинг
 
-ИЗМЕНЕНИЯ (OOM-fix):
-1. Модель заменена: L12 (118M параметров, ~500MB RAM)
-                  → L6  (22M параметров, ~100MB RAM)
-   Качество для RU+EN остаётся хорошим, RAM падает в ~5 раз.
-2. torch.no_grad() на всех encode — убирает аллокации градиентов.
-3. gc.collect() после батч-операций — возвращает RAM ОС.
-4. import re вынесен на верхний уровень (не внутри метода).
+СТРАТЕГИЯ (OOM-fix):
+L6 модель заблокирована на HuggingFace (401), поэтому оставляем L12.
+Вместо этого убираем PyTorch и используем ONNX Runtime:
+  - PyTorch runtime: ~200MB RAM → ONNX Runtime: ~30MB RAM
+  - L12 модель ONNX: ~280MB в памяти
+  - Итого: ~350MB вместо ~700MB → помещается в 512MB Railway
 
-Модель: paraphrase-multilingual-MiniLM-L6-v2
-- Работает на CPU (Railway бесплатный план)
-- Поддерживает 50+ языков включая русский и английский
-- Размер вектора: 384 числа (тот же что у L12!)
-- Размер модели: ~80MB (vs ~470MB у L12)
+Модель: paraphrase-multilingual-MiniLM-L12-v2 (ONNX)
+- Работает на CPU
+- Поддерживает русский + английский
+- Размер вектора: 384 числа
 """
 
 import gc
@@ -23,15 +21,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
+from optimum.onnxruntime import ORTModelForFeatureExtraction
+from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-# ─── ГЛАВНОЕ ИЗМЕНЕНИЕ ───────────────────────
-# L12 → L6: та же архитектура, те же 384-мерные векторы,
-# но 6 слоёв вместо 12 — помещается в 512MB Railway.
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L6-v2"
+MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
 
 # ─────────────────────────────────────────────
@@ -48,12 +43,11 @@ class MatchResult:
     company: str
     url: str
     salary_text: str
-    score: float  # 0.0 – 1.0, где 1.0 = идеальное совпадение
-    score_percent: int  # score * 100, для отображения
-    source: str = "hh"  # "hh" или "remoteok"
+    score: float
+    score_percent: int
+    source: str = "hh"
 
     def format_message(self, rank: int) -> str:
-        """Форматирует вакансию для отправки в Telegram"""
         bar = self._score_bar()
         source_badge = (
             "🌐 RemoteOK"
@@ -69,8 +63,75 @@ class MatchResult:
         )
 
     def _score_bar(self) -> str:
-        filled = round(self.score_percent / 20)  # 5 сегментов
+        filled = round(self.score_percent / 20)
         return "🟩" * filled + "⬜" * (5 - filled)
+
+
+# ─────────────────────────────────────────────
+# ONNX-обёртка (заменяет PyTorch целиком)
+# ─────────────────────────────────────────────
+
+
+class ONNXEmbedder:
+    """
+    Загружает модель через ONNX Runtime вместо PyTorch.
+    Экономит ~200MB RAM за счёт отсутствия PyTorch.
+    Интерфейс совместим с SentenceTransformer.encode().
+    """
+
+    def __init__(self, model_name: str):
+        logger.info("Загрузка ONNX модели %s...", model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = ORTModelForFeatureExtraction.from_pretrained(
+            model_name, export=True
+        )
+        gc.collect()
+        logger.info("ONNX модель загружена ✅")
+
+    def encode(
+        self,
+        texts,
+        batch_size: int = 32,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+    ) -> np.ndarray:
+        """Совместимый с SentenceTransformer.encode() интерфейс"""
+        single_input = isinstance(texts, str)
+        if single_input:
+            texts = [texts]
+
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="np",
+            )
+            outputs = self.model(**inputs)
+
+            # Mean pooling
+            token_embeddings = outputs.last_hidden_state
+            attention_mask = inputs["attention_mask"]
+            mask_expanded = np.expand_dims(attention_mask, -1).astype(np.float32)
+            sum_embeddings = np.sum(token_embeddings * mask_expanded, axis=1)
+            sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+            embeddings = sum_embeddings / sum_mask
+
+            if normalize_embeddings:
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                embeddings = embeddings / np.clip(norms, a_min=1e-9, a_max=None)
+
+            all_embeddings.append(embeddings)
+
+        result = np.vstack(all_embeddings) if len(all_embeddings) > 1 else all_embeddings[0]
+        gc.collect()
+
+        if single_input and result.ndim == 2 and result.shape[0] == 1:
+            return result[0]
+        return result
 
 
 # ─────────────────────────────────────────────
@@ -81,53 +142,34 @@ class MatchResult:
 class EmbeddingPipeline:
     """
     Загружает модель, создаёт векторы, считает совпадение.
-
-    Использование:
-        pipeline = EmbeddingPipeline()
-        resume_vec = pipeline.embed_resume(resume)
-        matches = pipeline.match(resume_vec, vacancies, top_k=10)
+    Использует ONNX Runtime для экономии RAM.
     """
 
     def __init__(self, model_name: str = MODEL_NAME):
-        logger.info("Загрузка модели %s...", model_name)
-        self.model = SentenceTransformer(model_name, device="cpu")
-        logger.info("Модель загружена ✅")
+        self.model = ONNXEmbedder(model_name)
 
     # ── Создание векторов ──────────────────────
 
     def embed_resume(self, resume) -> np.ndarray:
-        """
-        Принимает ParsedResume, возвращает вектор 384 чисел.
-        Собирает текст из всех полей — чем больше данных, тем точнее вектор.
-        """
         text = self._resume_to_text(resume)
         return self._embed(text)
 
     def embed_vacancy(self, vacancy: dict) -> np.ndarray:
-        """Принимает словарь вакансии (hh.ru формат), возвращает вектор."""
         text = self._vacancy_to_text(vacancy)
         return self._embed(text)
 
     def embed_text(self, text: str) -> np.ndarray:
-        """Векторизует произвольный текст"""
         return self._embed(text)
 
     def embed_batch(self, texts: list[str]) -> np.ndarray:
-        """
-        Векторизует список текстов разом — быстрее чем по одному.
-        Возвращает матрицу shape (len(texts), 384)
-        """
         if not texts:
             return np.array([])
-        with torch.no_grad():
-            result = self.model.encode(
-                texts,
-                batch_size=32,
-                show_progress_bar=False,
-                normalize_embeddings=True,
-            )
-        gc.collect()
-        return result
+        return self.model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
 
     # ── Матчинг ───────────────────────────────
 
@@ -137,38 +179,21 @@ class EmbeddingPipeline:
         vacancies: list[dict],
         top_k: int = 10,
     ) -> list[MatchResult]:
-        """
-        Главный метод матчинга.
-
-        resume_vector — вектор резюме из embed_resume()
-        vacancies — список вакансий в формате hh.ru API
-        top_k — сколько лучших вернуть
-
-        Возвращает список MatchResult, отсортированный по убыванию score.
-        """
         if not vacancies:
             return []
 
-        # Векторизуем все вакансии разом (батч — быстро)
         vacancy_texts = [self._vacancy_to_text(v) for v in vacancies]
         vacancy_vectors = self.embed_batch(vacancy_texts)
-
-        # Считаем cosine similarity со всеми вакансиями
         scores = self._cosine_similarity_batch(resume_vector, vacancy_vectors)
-
-        # Берём топ-K индексов
         top_indices = np.argsort(scores)[::-1][:top_k]
 
         results = []
         for idx in top_indices:
             vacancy = vacancies[idx]
             score = float(scores[idx])
-
-            # Определяем источник
             vac_id = str(vacancy.get("id", ""))
             source = "remoteok" if vac_id.startswith("remoteok_") else "hh"
 
-            # Для Remotive берём salary_text из _salary_text поля
             if source == "remoteok":
                 salary_raw = vacancy.get("_salary_text", "")
                 salary_text = f"💰 {salary_raw}\n" if salary_raw else ""
@@ -191,104 +216,74 @@ class EmbeddingPipeline:
         return results
 
     def similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """Cosine similarity между двумя векторами. Результат: 0.0 – 1.0"""
         return float(
             np.dot(vec1, vec2)
             / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-10)
         )
 
-    # ── Сериализация векторов ─────────────────
+    # ── Сериализация ──────────────────────────
 
     @staticmethod
     def vector_to_bytes(vector: np.ndarray) -> bytes:
-        """Конвертирует вектор в bytes для хранения в PostgreSQL (bytea)"""
         return vector.astype(np.float32).tobytes()
 
     @staticmethod
     def bytes_to_vector(data: bytes) -> np.ndarray:
-        """Восстанавливает вектор из bytes"""
         return np.frombuffer(data, dtype=np.float32)
 
     @staticmethod
     def vector_to_list(vector: np.ndarray) -> list[float]:
-        """Конвертирует в список для pgvector"""
         return vector.tolist()
 
     # ── Приватные методы ──────────────────────
 
     def _embed(self, text: str) -> np.ndarray:
-        """Создаёт нормализованный вектор для одного текста"""
-        with torch.no_grad():
-            result = self.model.encode(
-                text,
-                show_progress_bar=False,
-                normalize_embeddings=True,
-            )
-        return result
+        return self.model.encode(
+            text,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
 
     def _cosine_similarity_batch(
-        self,
-        query_vector: np.ndarray,
-        matrix: np.ndarray,
+        self, query_vector: np.ndarray, matrix: np.ndarray
     ) -> np.ndarray:
-        """
-        Быстрое вычисление cosine similarity между одним вектором и матрицей.
-        Поскольку normalize_embeddings=True, можно просто dot product.
-        """
         return np.dot(matrix, query_vector)
 
     def _resume_to_text(self, resume) -> str:
-        """
-        Собирает текст резюме для векторизации.
-        Порядок важен — желаемая должность и навыки идут первыми,
-        они важнее для матчинга.
-        """
         parts = []
-
         if resume.desired_position:
             parts.append(resume.desired_position)
             parts.append(resume.desired_position)
-
         if resume.skills:
             parts.append("Навыки: " + ", ".join(resume.skills))
-
         if resume.experience_text:
             parts.append(resume.experience_text[:1000])
-
         if resume.education:
             parts.append(resume.education)
-
         return "\n".join(parts) if parts else resume.raw_text[:2000]
 
     def _vacancy_to_text(self, vacancy: dict) -> str:
-        """Собирает текст вакансии для векторизации"""
         parts = []
-
         title = vacancy.get("name", "")
         if title:
             parts.append(title)
             parts.append(title)
-
         employer = vacancy.get("employer", {}).get("name", "")
         if employer:
             parts.append(employer)
-
         snippet = vacancy.get("snippet", {})
         if snippet:
             requirement = snippet.get("requirement", "") or ""
             responsibility = snippet.get("responsibility", "") or ""
             parts.append(requirement)
             parts.append(responsibility)
-
         description = vacancy.get("description", "") or ""
         if description:
             clean = re.sub(r"<[^>]+>", " ", description)
             parts.append(clean[:800])
-
         return "\n".join(p for p in parts if p)
 
     def _format_salary(self, vacancy: dict) -> str:
-        """Форматирует зарплату для вывода"""
         salary = vacancy.get("salary")
         if not salary:
             return ""
@@ -305,17 +300,13 @@ class EmbeddingPipeline:
 
 
 # ─────────────────────────────────────────────
-# Синглтон — одна модель на весь процесс бота
+# Синглтон
 # ─────────────────────────────────────────────
 
 _pipeline_instance: Optional[EmbeddingPipeline] = None
 
 
 def get_pipeline() -> EmbeddingPipeline:
-    """
-    Возвращает единственный экземпляр EmbeddingPipeline.
-    Модель загружается один раз при первом вызове.
-    """
     global _pipeline_instance
     if _pipeline_instance is None:
         _pipeline_instance = EmbeddingPipeline()

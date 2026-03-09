@@ -7,11 +7,11 @@ asyncpg==0.30.0
 pytz
 numpy==1.26.4
 
-# ── CPU-only PyTorch ──────────────────────────
-# ВАЖНО: torch устанавливается ПЕРВЫМ в Dockerfile отдельной командой
-# с --index-url https://download.pytorch.org/whl/cpu
-# Здесь он НЕ указан, чтобы pip не перетянул CUDA-версию (~800MB).
-# Если вы ставите локально: pip install torch==2.4.0+cpu --index-url https://download.pytorch.org/whl/cpu
-
-sentence-transformers==2.7.0
+# ── ONNX Runtime replaces PyTorch ─────────────
+# PyTorch: ~200MB RAM at runtime
+# ONNX Runtime: ~30MB RAM at runtime
+# Same model, same vectors, fraction of the memory.
+onnxruntime==1.17.0
+optimum[onnxruntime]==1.17.1
 transformers==4.40.0
+sentence-transformers==2.7.0
