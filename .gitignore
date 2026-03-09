@@ -3,3 +3,5 @@ __pycache__/
 .env
 *.pyc
 .DS_Store
+onnx_model/
+onnx_model_quantized/model_quantized.onnx
