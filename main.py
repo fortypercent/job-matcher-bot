@@ -1887,6 +1887,139 @@ async def handle_hr_vacancy_input(update: Update, context: ContextTypes.DEFAULT_
 
 
 # ─────────────────────────────────────────────
+# Публикация вакансий в канал
+# ─────────────────────────────────────────────
+
+# Список поисковых запросов для рандомных вакансий в канале
+CHANNEL_SEARCH_QUERIES = [
+    "Python разработчик",
+    "Data Analyst",
+    "Frontend разработчик",
+    "Backend разработчик",
+    "DevOps инженер",
+    "Product Manager",
+    "UX/UI дизайнер",
+    "Data Scientist",
+    "QA инженер",
+    "Machine Learning",
+    "Системный аналитик",
+    "Java разработчик",
+    "Golang разработчик",
+    "iOS разработчик",
+    "Android разработчик",
+    "маркетолог",
+    "HR менеджер",
+    "проджект менеджер",
+    "1С программист",
+    "Fullstack разработчик",
+]
+
+
+def _format_channel_vacancy(job: dict, query: str) -> str:
+    """Форматирует вакансию для публикации в канале."""
+    title = job.get("name", "Вакансия")
+    company = job.get("employer", {}).get("name", "")
+    url = job.get("alternate_url", "")
+    salary = _format_salary(job)
+
+    # Требования из сниппета
+    snippet = job.get("snippet", {})
+    requirement = (snippet.get("requirement") or "").replace("<highlighttext>", "").replace("</highlighttext>", "")
+    responsibility = (snippet.get("responsibility") or "").replace("<highlighttext>", "").replace("</highlighttext>", "")
+
+    # Локация
+    area = job.get("area", {}).get("name", "")
+    schedule = job.get("schedule", {}).get("name", "")
+    location_parts = [p for p in [area, schedule] if p]
+    location_text = f"📍 {', '.join(location_parts)}\n" if location_parts else ""
+
+    # Опыт
+    experience = job.get("experience", {}).get("name", "")
+    exp_text = f"📅 Опыт: {experience}\n" if experience else ""
+
+    lines = [
+        f"💼 {title}",
+        f"🏢 {company}" if company else "",
+        salary.strip() if salary else "",
+        location_text.strip() if location_text else "",
+        exp_text.strip() if exp_text else "",
+        "",
+        f"📋 {requirement[:200]}" if requirement else "",
+        f"🔧 {responsibility[:200]}" if responsibility else "",
+        "",
+        f"🔗 Откликнуться: {url}" if url else "",
+        "",
+        f"🔎 #{query.replace(' ', '_')}",
+        "📲 @your_bot_username — подбор вакансий по AI",
+    ]
+
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+async def post_random_vacancies_to_channel(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Публикует случайные вакансии в Telegram-канал.
+    Запускается по расписанию через job_queue.
+
+    Настройки через переменные окружения:
+    - CHANNEL_ID: ID или @username канала (например @my_vacancies)
+    - CHANNEL_POST_COUNT: сколько вакансий постить за раз (по умолчанию 5)
+    """
+    import random
+
+    channel_id = os.getenv("CHANNEL_ID")
+    if not channel_id:
+        logger.debug("CHANNEL_ID не задан — пропускаем публикацию в канал")
+        return
+
+    post_count = int(os.getenv("CHANNEL_POST_COUNT", "5"))
+
+    # Выбираем случайный поисковый запрос
+    query = random.choice(CHANNEL_SEARCH_QUERIES)
+
+    # Случайный регион (Москва, Питер, вся Россия)
+    area = random.choice([113, 1, 2])
+
+    logger.info("Канал: ищу '%s' (area=%s) для публикации", query, area)
+
+    try:
+        vacancies = await fetch_vacancies(query, area=area, limit=50)
+
+        if not vacancies:
+            logger.warning("Канал: вакансии не найдены для '%s'", query)
+            return
+
+        # Фильтруем вакансии с зарплатой (они интереснее для канала)
+        with_salary = [v for v in vacancies if v.get("salary")]
+        pool = with_salary if len(with_salary) >= post_count else vacancies
+
+        # Берём случайные, не повторяясь
+        selected = random.sample(pool, min(post_count, len(pool)))
+
+        posted = 0
+        for job in selected:
+            try:
+                text = _format_channel_vacancy(job, query)
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=text,
+                    disable_web_page_preview=True,
+                )
+                posted += 1
+
+                # Пауза между постами чтобы не флудить
+                await asyncio.sleep(3)
+
+            except Exception as e:
+                logger.error("Канал: ошибка отправки вакансии: %s", e)
+
+        logger.info("Канал: опубликовано %d/%d вакансий по запросу '%s'", posted, post_count, query)
+
+    except Exception as e:
+        logger.error("Канал: ошибка получения вакансий: %s", e)
+
+
+# ─────────────────────────────────────────────
 # Инициализация и запуск
 # ─────────────────────────────────────────────
 
@@ -1966,6 +2099,21 @@ def main():
         first=60,
         name="digest_tick",
     )
+
+    # Публикация в канал — каждые 4 часа (настраивается через CHANNEL_INTERVAL_HOURS)
+    channel_interval = int(os.getenv("CHANNEL_INTERVAL_HOURS", "4")) * 3600
+    if os.getenv("CHANNEL_ID"):
+        app.job_queue.run_repeating(
+            post_random_vacancies_to_channel,
+            interval=channel_interval,
+            first=120,  # первый пост через 2 минуты после старта
+            name="channel_post",
+        )
+        logger.info(
+            "📢 Публикация в канал %s каждые %s ч.",
+            os.getenv("CHANNEL_ID"),
+            os.getenv("CHANNEL_INTERVAL_HOURS", "4"),
+        )
 
     logger.info("🤖 Бот запущен!")
     app.run_polling()
