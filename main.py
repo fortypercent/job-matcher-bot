@@ -1950,7 +1950,7 @@ def _format_channel_vacancy(job: dict, query: str) -> str:
         f"🔗 Откликнуться: {url}" if url else "",
         "",
         f"🔎 #{query.replace(' ', '_')}",
-        "📲 @your_bot_username — подбор вакансий по AI",
+        "📲 @bobajobabot — подбор вакансий по AI",
     ]
 
     return "\n".join(line for line in lines if line is not None).strip()
@@ -2121,4 +2121,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
